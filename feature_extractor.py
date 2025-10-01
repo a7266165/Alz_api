@@ -1,0 +1,165 @@
+# api/feature_extractor.py
+"""
+VGGFace特徵提取模組
+"""
+import numpy as np
+from deepface import DeepFace
+import json
+import logging
+from typing import Optional, List, Tuple
+
+logger = logging.getLogger(__name__)
+
+class VGGFaceExtractor:
+    """VGGFace特徵提取器"""
+    
+    def __init__(self, feature_selection_path: Optional[str] = None):
+        """
+        Args:
+            feature_selection_path: 特徵選擇配置檔路徑
+        """
+        self.feature_selection = None
+        
+        if feature_selection_path:
+            try:
+                with open(feature_selection_path, 'r') as f:
+                    self.feature_selection = json.load(f)
+                print(f"✓ 載入特徵選擇: {self.feature_selection['original_dim']} -> {self.feature_selection['selected_dim']}維")
+            except Exception as e:
+                print(f"✗ 無法載入特徵選擇: {e}")
+    
+    def extract_vggface(self, img_array: np.ndarray) -> Optional[np.ndarray]:
+        """
+        提取VGGFace特徵
+        
+        Args:
+            img_array: numpy array格式的圖片
+            
+        Returns:
+            4096維特徵向量
+        """
+        try:
+            result = DeepFace.represent(
+                img_path=img_array,
+                model_name='VGG-Face',
+                enforce_detection=False,
+                detector_backend='skip',  # 已經預處理過了
+                align=False  # 已經對齊過了
+            )
+            
+            if result and len(result) > 0:
+                embedding = np.array(result[0]['embedding'])
+                return embedding
+                
+        except Exception as e:
+            logger.error(f"VGGFace提取失敗: {e}")
+        
+        return None
+    
+    def calculate_difference(self, left_features: np.ndarray, right_features: np.ndarray) -> np.ndarray:
+        """
+        計算左右臉差異特徵（絕對值）
+        
+        Args:
+            left_features: 左臉特徵
+            right_features: 右臉特徵
+            
+        Returns:
+            差異特徵向量
+        """
+        return np.abs(left_features - right_features)
+    
+    def process_image_pair(self, left_img: np.ndarray, right_img: np.ndarray) -> Optional[np.ndarray]:
+        """
+        處理一對左右臉圖片，提取差異特徵
+        
+        Args:
+            left_img: 左臉鏡射圖
+            right_img: 右臉鏡射圖
+            
+        Returns:
+            差異特徵向量 (4096維)
+        """
+        # 提取VGGFace特徵
+        left_features = self.extract_vggface(left_img)
+        right_features = self.extract_vggface(right_img)
+        
+        if left_features is None or right_features is None:
+            return None
+        
+        # 計算差異
+        diff_features = self.calculate_difference(left_features, right_features)
+        
+        return diff_features
+    
+    def process_with_demographics(
+        self, 
+        mirror_pairs: List[Tuple[np.ndarray, np.ndarray]], 
+        age: int, 
+        gender: int
+    ) -> np.ndarray:
+        """
+        處理多對鏡射圖片並加入人口學特徵，最後應用特徵選擇
+        
+        Args:
+            mirror_pairs: [(左臉鏡射, 右臉鏡射), ...]
+            age: 年齡
+            gender: 性別 (0=女, 1=男)
+            
+        Returns:
+            篩選後的特徵向量（166維）
+        """
+        # 1. 提取所有差異特徵
+        all_differences = []
+        for left_mirror, right_mirror in mirror_pairs:
+            diff_features = self.process_image_pair(left_mirror, right_mirror)
+            if diff_features is not None:
+                all_differences.append(diff_features)
+        
+        if not all_differences:
+            raise ValueError("無法提取有效特徵")
+        
+        print(f"  成功提取 {len(all_differences)} 張照片的特徵")
+        
+        # 2. 平均多張照片的特徵 (4096維)
+        avg_features = np.mean(all_differences, axis=0)
+        print(f"  平均特徵維度: {avg_features.shape[0]}")
+        
+        # 3. 加入人口學特徵 (變成4098維)
+        combined_features = np.concatenate([
+            avg_features,      # 4096維 VGGFace差異特徵
+            [age, gender]      # 2維 人口學特徵
+        ])
+        print(f"  加入人口學後: {combined_features.shape[0]}維")
+        
+        # 4. 應用特徵選擇
+        selected_features = self.apply_feature_selection(combined_features)
+        print(f"  特徵選擇後: {selected_features.shape[0]}維")
+        
+        return selected_features
+    
+    def apply_feature_selection(self, features: np.ndarray) -> np.ndarray:
+        """
+        篩選特徵
+        
+        Args:
+            features: 完整特徵向量（4098維 = 4096 VGGFace + 2 demographics）
+            
+        Returns:
+            篩選後的特徵（166維）
+        """
+        if self.feature_selection is None:
+            # 沒有特徵選擇配置，返回原始特徵
+            return features
+        
+        selected_indices = self.feature_selection['selected_indices']
+        
+        # 確保索引在範圍內
+        valid_indices = [i for i in selected_indices if i < len(features)]
+        
+        if len(valid_indices) != len(selected_indices):
+            logger.warning(
+                f"部分索引超出範圍：{len(selected_indices)} -> {len(valid_indices)}"
+            )
+        
+        return features[valid_indices]

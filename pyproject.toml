@@ -1,22 +1,28 @@
 [project]
-name = "ad-sensor-project"
+name = "Alz_api"
 version = "0.1.0"
 description = ""
 authors = [
     {name = "a7266165",email = "M123020018@student.nsysu.edu.tw"}
 ]
+license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "pandas (>=2.2.3,<3.0.0)",
-    "opencv-python (>=4.11.0.86,<5.0.0.0)",
-    "xgboost (>=3.0.2,<4.0.0)",
+    "tensorflow-io-gcs-filesystem (==0.31.0)",
     "mediapipe (>=0.10.21,<0.11.0)",
-    "fastapi (>=0.115.12,<0.116.0)",
-    "uvicorn (>=0.34.3,<0.35.0)",
-    "python-multipart (>=0.0.20,<0.0.21)",
+    "deepface (>=0.0.95,<0.0.96)",
+    "torch (>=2.8.0,<3.0.0)",
+    "scikit-learn (>=1.7.2,<2.0.0)",
+    "xgboost (>=3.0.5,<4.0.0)",
+    "tensorflow (==2.15.0)",
+    "tf-keras (==2.15.0)",
+    "fastapi (>=0.118.0,<0.119.0)",
+    "pydantic (>=2.11.9,<3.0.0)",
+    "uvicorn (>=0.37.0,<0.38.0)",
     "py7zr (>=1.0.0,<2.0.0)",
     "rarfile (>=4.2,<5.0)",
+    "python-multipart (>=0.0.20,<0.0.21)"
 ]
 
 

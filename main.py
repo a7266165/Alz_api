@@ -18,6 +18,9 @@ from fastapi import FastAPI, File, UploadFile
 import uvicorn
 from pydantic import BaseModel
 
+from preprocess import FacePreprocessor
+from feature_extractor import VGGFaceExtractor
+
 # 多格式壓縮檔支援
 try:
     import py7zr
@@ -61,7 +64,8 @@ class QuestionnaireData(BaseModel):
 class FaceAnalysisAPI:
     """人臉分析API類別"""
     
-    def __init__(self, symmetry_csv_path: str = None, asymmetry_model_path: str = None, q6ds_model_path: str = None):
+    def __init__(self, symmetry_csv_path: str = None, q6ds_model_path: str = None, 
+                vggface_model_path: str = None, feature_selection_path: str = None):
         # 初始化MediaPipe FaceMesh
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -73,18 +77,36 @@ class FaceAnalysisAPI:
         )
         
         self.symmetry_csv_path = symmetry_csv_path
-        self.asymmetry_model_path = asymmetry_model_path
         self.q6ds_model_path = q6ds_model_path
         
-        # 載入不對稱性XGBoost模型
-        self.asymmetry_model = None
-        if asymmetry_model_path and os.path.exists(asymmetry_model_path):
-            try:
-                self.asymmetry_model = xgb.Booster()
-                self.asymmetry_model.load_model(asymmetry_model_path)
-            except Exception as e:
-                print(f"載入不對稱性XGBoost模型失敗: {e}")
+        # 深度學習模組初始化
+        self.use_deep_learning = False
+        self.preprocessor = None
+        self.feature_extractor = None
+        self.vggface_xgb_model = None
         
+        # 檢查深度學習模型檔案
+        if vggface_model_path and feature_selection_path and \
+        os.path.exists(vggface_model_path) and os.path.exists(feature_selection_path):
+            try:
+                # 初始化預處理器
+                self.preprocessor = FacePreprocessor()
+                
+                # 初始化特徵提取器（含特徵選擇）
+                self.feature_extractor = VGGFaceExtractor(feature_selection_path)
+                
+                # 載入XGBoost模型
+                self.vggface_xgb_model = xgb.Booster()
+                self.vggface_xgb_model.load_model(vggface_model_path)
+                
+                self.use_deep_learning = True
+            except Exception as e:
+                print(f"深度學習載入失敗: {e}")
+                self.use_deep_learning = False
+        else:
+            print("⚠️ 深度學習模組未啟用（缺少必要檔案）")
+            self.use_deep_learning = False
+
         # 載入6QDS XGBoost模型
         self.q6ds_model = None
         if q6ds_model_path and os.path.exists(q6ds_model_path):
@@ -160,6 +182,16 @@ class FaceAnalysisAPI:
     def _analyze_face_from_folder(self, folder_path: str, questionnaire_data: QuestionnaireData = None, skip_face_selection: bool = False) -> Dict:
         """從資料夾分析人臉"""
         try:
+            # 檢查深度學習模組
+            if not self.use_deep_learning:
+                return {
+                    "success": False,
+                    "error": "深度學習模組未啟用，請檢查模型檔案",
+                    "q6ds_classification_result": None,
+                    "asymmetry_classification_result": None,
+                    "marked_figure": None
+                }
+            
             # 步驟1: 決定是否選擇最正面的照片並轉正
             if not skip_face_selection:
                 rotated_images = self._align_and_select_faces(folder_path)
@@ -176,24 +208,23 @@ class FaceAnalysisAPI:
                     "marked_figure": None
                 }
             
-            # 步驟2: 提取正規化特徵點座標
-            landmarks = self._extract_normalized_landmark_coordinates(rotated_images)
-            
-            if landmarks is None:
-                return {
-                    "success": False,
-                    "error": "無法提取特徵點",
-                    "q6ds_classification_result": None,
-                    "asymmetry_classification_result": None,
-                    "marked_figure": None
-                }
-            
-            # 步驟3: 計算不對稱性指標和預測
+            # 步驟2&3: 深度學習分析
             asymmetry_classification = None
-            if self.symmetry_csv_path:
-                symmetry_metrics = self._calculate_symmetry_metrics(landmarks)
-                if symmetry_metrics and self.asymmetry_model:
-                    asymmetry_classification = self._predict_asymmetry(symmetry_metrics)
+            
+            # 預處理：對齊、鏡射、CLAHE
+            mirror_pairs = self.preprocessor.process_images(rotated_images)
+            
+            # 特徵提取 + 人口學 + 特徵選擇
+            age = questionnaire_data.age if questionnaire_data else 65
+            gender = questionnaire_data.gender if questionnaire_data else 1
+            
+            selected_features = self.feature_extractor.process_with_demographics(
+                mirror_pairs, age, gender
+            )
+            
+            # XGBoost預測
+            dmatrix = xgb.DMatrix(selected_features.reshape(1, -1))
+            asymmetry_classification = float(self.vggface_xgb_model.predict(dmatrix)[0])
             
             # 步驟4: 6QDS問卷分類預測
             q6ds_classification = None
@@ -210,7 +241,7 @@ class FaceAnalysisAPI:
                 "asymmetry_classification_result": asymmetry_classification,
                 "marked_figure": marked_figure
             }
-            
+        
         except Exception as e:
             return {
                 "success": False,
@@ -310,53 +341,6 @@ class FaceAnalysisAPI:
                 continue
         return images
 
-    def _extract_normalized_landmark_coordinates(self, rotated_face_images: List[np.ndarray]) -> Optional[np.ndarray]:
-        """提取正規化的特徵點座標"""
-        landmarks_all = []
-
-        for image in rotated_face_images:
-            height, width = image.shape[:2]
-            results = self.face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            if not results.multi_face_landmarks:
-                continue
-                
-            landmarks = results.multi_face_landmarks[0].landmark
-
-            # 取出臉部最左邊和最上面的點
-            left_x = landmarks[234].x * width
-            top_y = landmarks[10].y * height
-            
-            pts = []
-            for i in range(468):
-                pt = landmarks[i]
-                x = (pt.x * width) - left_x
-                y = (pt.y * height) - top_y
-                pts.append((x, y))
-            pts = np.array(pts)
-
-            # 依據臉部最右側點固定臉的寬度為500
-            right_x = pts[454][0]
-            if right_x <= 0:
-                continue
-                
-            scale_factor = 500 / right_x
-            pts = pts * scale_factor
-            pts = pts.T  # 轉置成 (2, 468)
-            landmarks_all.append(pts)
-
-        if not landmarks_all:
-            return None
-
-        landmarks_all = np.array(landmarks_all)
-        # 取平均
-        landmarks_all = np.mean(landmarks_all, axis=0).reshape(1, 2, 468)
-
-        # 新增z軸座標（設為0）
-        z_coords = np.zeros((1, 1, 468))
-        landmarks_all = np.concatenate([landmarks_all, z_coords], axis=1)
-
-        return landmarks_all
-
     def _parse_idxs(self, s: str) -> List[int]:
         """解析索引字串"""
         return list(map(int, s.split(",")))
@@ -373,124 +357,6 @@ class FaceAnalysisAPI:
         x2, y2 = x[j], y[j]
         x3, y3 = x[k], y[k]
         return abs((x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2)
-
-    def _calculate_symmetry_metrics(self, landmarks: np.ndarray) -> Optional[Dict]:
-        """計算對稱性指標"""
-        if not self.symmetry_csv_path or not os.path.exists(self.symmetry_csv_path):
-            return None
-            
-        try:
-            # 讀取對稱配對資料
-            df_pairs = pd.read_csv(self.symmetry_csv_path)
-
-            # 拆分三種類型的配對
-            df_pts = df_pairs[df_pairs["pair_type"].str.startswith("point")].copy()
-            df_lines = df_pairs[df_pairs["pair_type"].str.startswith("line")].copy()
-            df_tri = df_pairs[df_pairs["pair_type"].str.startswith("triangle")].copy()
-
-            # 解析線段和三角形的索引
-            if not df_lines.empty:
-                df_lines["left_idx"] = df_lines["left"].apply(self._parse_idxs)
-                df_lines["right_idx"] = df_lines["right"].apply(self._parse_idxs)
-            if not df_tri.empty:
-                df_tri["left_idx"] = df_tri["left"].apply(self._parse_idxs)
-                df_tri["right_idx"] = df_tri["right"].apply(self._parse_idxs)
-
-            # 從landmarks提取x, y座標
-            x_coords = landmarks[0, 0, :]
-            y_coords = landmarks[0, 1, :]
-
-            # 建立座標字典
-            x = {i: x_coords[i] for i in range(468)}
-            y = {i: y_coords[i] for i in range(468)}
-
-            # 計算基準線
-            baseline_x = abs(x[234] - x[454])
-            baseline_y = abs(y[10] - y[152])
-
-            # 避免除以零
-            if baseline_x == 0:
-                baseline_x = 1
-            if baseline_y == 0:
-                baseline_y = 1
-
-            # 初始化累加器
-            total_pt_x = 0.0
-            total_pt_y = 0.0
-            total_line = 0.0
-            total_tri = 0.0
-
-            # 計算點對稱 X 差值
-            for _, r in df_pts.iterrows():
-                idx_l = int(r["left"])
-                idx_r = int(r["right"])
-                if idx_l < 468 and idx_r < 468:
-                    diff_x = abs(abs(x[idx_l] - 250) - abs(x[idx_r] - 250)) / baseline_x
-                    total_pt_x += diff_x
-
-            # 計算點對稱 Y 差值
-            for _, r in df_pts.iterrows():
-                idx_l = int(r["left"])
-                idx_r = int(r["right"])
-                if idx_l < 468 and idx_r < 468:
-                    diff_y = abs(y[idx_l] - y[idx_r]) / baseline_y
-                    total_pt_y += diff_y
-
-            # 計算線段對稱差值
-            for _, r in df_lines.iterrows():
-                if all(idx < 468 for idx in r["left_idx"]) and all(idx < 468 for idx in r["right_idx"]):
-                    ld = self._line_len(x, y, r["left_idx"])
-                    rd = self._line_len(x, y, r["right_idx"])
-                    if ld + rd > 0:
-                        diff_line = abs(ld - rd) / (ld + rd)
-                        total_line += diff_line
-
-            # 計算三角形面積對稱差值
-            for _, r in df_tri.iterrows():
-                if all(idx < 468 for idx in r["left_idx"]) and all(idx < 468 for idx in r["right_idx"]):
-                    la = self._tri_area(x, y, r["left_idx"])
-                    ra = self._tri_area(x, y, r["right_idx"])
-                    if la + ra > 0:
-                        diff_tri = abs(la - ra) / (la + ra)
-                        total_tri += diff_tri
-
-            return {
-                "sum_point_x_diff": float(total_pt_x),
-                "sum_point_y_diff": float(total_pt_y),
-                "sum_line_diff": float(total_line),
-                "sum_triangle_area_diff": float(total_tri),
-            }
-
-        except Exception as e:
-            print(f"計算對稱性指標錯誤: {str(e)}")
-            return None
-
-    def _predict_asymmetry(self, symmetry_metrics: Dict) -> Optional[float]:
-        """使用XGBoost模型預測不對稱性分類結果"""
-        if not self.asymmetry_model or not symmetry_metrics:
-            return None
-            
-        try:
-            # 準備輸入特徵
-            features = [
-                symmetry_metrics["sum_point_x_diff"],
-                symmetry_metrics["sum_point_y_diff"], 
-                symmetry_metrics["sum_line_diff"],
-                symmetry_metrics["sum_triangle_area_diff"]
-            ]
-            
-            # 轉換為XGBoost DMatrix格式
-            dmatrix = xgb.DMatrix([features])
-            
-            # 預測
-            prediction = self.asymmetry_model.predict(dmatrix)
-            
-            # 回傳預測結果（通常是機率值或分類結果）
-            return float(prediction[0])
-            
-        except Exception as e:
-            print(f"不對稱性XGBoost預測錯誤: {str(e)}")
-            return None
 
     def _predict_6qds(self, questionnaire_data: QuestionnaireData) -> Optional[float]:
         """使用XGBoost模型預測6QDS分類結果"""
@@ -643,13 +509,16 @@ class FaceAnalysisAPI:
 class FaceAnalysisFastAPI:
     """FastAPI 服務封裝"""
     
-    def __init__(self, symmetry_csv_path: str = None, asymmetry_model_path: str = None, q6ds_model_path: str = None):
+    def __init__(self, symmetry_csv_path: str = None,
+             q6ds_model_path: str = None, vggface_model_path: str = None, 
+             feature_selection_path: str = None):
         self.app = FastAPI(
             title="人臉分析與認知評估API",
             description="上傳人臉相片壓縮檔和問卷資料，回傳6QDS認知評估、不對稱性分類結果和標記圖片",
-            version="1.0.0"
+            version="2.0.0"
         )
-        self.analyzer = FaceAnalysisAPI(symmetry_csv_path, asymmetry_model_path, q6ds_model_path)
+        self.analyzer = FaceAnalysisAPI(symmetry_csv_path, q6ds_model_path, 
+                                   vggface_model_path, feature_selection_path)
         self._setup_routes()
     
     def _setup_routes(self):
@@ -938,19 +807,27 @@ print_startup_info()
 
 # 設定檔案路徑
 symmetry_csv_path = get_file_path("./data/symmetry_all_pairs.csv")
-asymmetry_model_path = get_file_path("./data/xgb_face_asym_model.json")
 q6ds_model_path = get_file_path("./data/xgb_6qds_model.json")
+vggface_model_path = get_file_path("./data/xgb_vggface_model.json")
+feature_selection_path = get_file_path("./data/feature_selection.json")
 
 # 檢查檔案存在性
 if symmetry_csv_path and not os.path.exists(symmetry_csv_path):
     print(f"警告: 找不到對稱性CSV檔案: {symmetry_csv_path}")
-if asymmetry_model_path and not os.path.exists(asymmetry_model_path):
-    print(f"警告: 找不到不對稱性XGBoost模型檔案: {asymmetry_model_path}")
 if q6ds_model_path and not os.path.exists(q6ds_model_path):
     print(f"警告: 找不到6QDS XGBoost模型檔案: {q6ds_model_path}")
+if vggface_model_path and not os.path.exists(vggface_model_path):
+    print(f"警告: 找不到VGGFace XGBoost模型檔案: {vggface_model_path}")
+if feature_selection_path and not os.path.exists(feature_selection_path):
+    print(f"警告: 找不到特徵選擇檔案: {feature_selection_path}")
 
 # 直接創建全域app實例
-api_server = FaceAnalysisFastAPI(symmetry_csv_path, asymmetry_model_path, q6ds_model_path)
+api_server = FaceAnalysisFastAPI(
+    symmetry_csv_path=symmetry_csv_path,
+    q6ds_model_path=q6ds_model_path,
+    vggface_model_path=vggface_model_path,
+    feature_selection_path=feature_selection_path
+)
 app = api_server.app
 
 # 主程式入口
