@@ -262,12 +262,34 @@ class FaceAnalysisAPI:
         cos_angle = np.clip(cos_angle, -1.0, 1.0)  # 避免數值誤差
         return np.degrees(np.arccos(cos_angle))
 
-    def _calc_intermediate_angle_sum(self, results, height: int, width: int) -> float:
-        """計算中間兩個夾角的總和"""
-        p1, p2, p3, p4 = [self._get_point(results, i, width, height) for i in (10, 168, 4, 2)]
-        angle1 = self._angle_between(p2 - p1, p3 - p2)
-        angle2 = self._angle_between(p3 - p2, p4 - p3)
-        return angle1 + angle2
+    def _calc_intermediate_angle_sum(self, results, image_shape) -> float:
+        """
+        計算臉部中軸角度
+        """
+        h, w = image_shape[:2]
+        
+        FACEMESH_MID_LINE = [
+            (10, 151), (151, 9), (9, 8), (8, 168),
+            (168, 6), (6, 197), (197, 195), (195, 5), (5, 4),
+            (4, 1), (1, 19), (19, 94), (94, 2)
+        ]
+        
+        angles = []
+        for pair in FACEMESH_MID_LINE:
+            point1 = results.multi_face_landmarks[0].landmark[pair[0]]
+            point2 = results.multi_face_landmarks[0].landmark[pair[1]]
+            
+            dot1 = np.array([point1.x * w, point1.y * h])
+            dot2 = np.array([point2.x * w, point2.y * h])
+            
+            vector = dot2 - dot1
+            if vector[1] != 0:
+                angle = np.arctan(vector[0] / vector[1])
+                angles.append(np.degrees(angle))
+            else:
+                angles.append(90.0 if vector[0] > 0 else -90.0)
+        
+        return sum(angles) / len(angles) if angles else 0
 
     def _mid_line_angle_all_points(self, results, height: int, width: int) -> float:
         """計算人臉中軸線各段的角度，並回傳平均角度"""
@@ -278,47 +300,49 @@ class FaceAnalysisAPI:
         return sum(angles) / len(angles)
 
     def _rotate_image(self, image: np.ndarray) -> np.ndarray:
-        """根據人臉中軸角度，將圖片旋轉調整至正立"""
+        """
+        計算圖片旋轉角度
+        """
         height, width = image.shape[:2]
         results = self.face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         if not results.multi_face_landmarks:
             return image
         
-        angle = self._mid_line_angle_all_points(results, height, width)
+        angle = self._calc_intermediate_angle_sum(results, image.shape)
         center = (width // 2, height // 2)
         M = cv2.getRotationMatrix2D(center, -angle, 1.0)
         return cv2.warpAffine(image, M, (width, height))
 
     def _align_and_select_faces(self, face_pic_folder: str) -> List[np.ndarray]:
-        """選取夾角總和最小的10張圖片並旋轉"""
+        """選取夾角最小的10張圖片並旋轉"""
         angle_dict = {}
         
         # 支援多種圖片格式
         valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
         
-        for file in os.listdir(face_pic_folder):
-            if not file.lower().endswith(valid_extensions):
-                continue
-                
+        for file in sorted([f for f in os.listdir(face_pic_folder) 
+                if f.lower().endswith(valid_extensions)]):
             path = os.path.join(face_pic_folder, file)
             image = cv2.imread(path)
             if image is None:
                 continue
                 
-            height, width = image.shape[:2]
             results = self.face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             if not results.multi_face_landmarks:
+                angle_dict[file] = float('inf')
                 continue
-                
-            angle_dict[file] = self._calc_intermediate_angle_sum(results, height, width)
+            
+            # 計算角度
+            angle = self._calc_intermediate_angle_sum(results, image.shape)
+            angle_dict[file] = abs(angle)  # 取絕對值
 
         if not angle_dict:
             return []
 
-        # 選出夾角總和最小的10張圖（代表正對相機）
+        # 選出角度絕對值最小的10張圖
         selected_files = sorted(angle_dict, key=lambda x: angle_dict[x])[:10]
 
-        # 將選取的圖片轉正
+        # 旋轉圖片
         rotated_images = []
         for file in selected_files:
             image = cv2.imread(os.path.join(face_pic_folder, file))
@@ -572,10 +596,10 @@ class FaceAnalysisFastAPI:
             
             # 檢查檔案大小
             content = await file.read()
-            if len(content) > 50 * 1024 * 1024:  # 50MB限制
+            if len(content) > 500 * 1024 * 1024:  # 50MB限制
                 return AnalysisResponse(
                     success=False,
-                    error="檔案大小超過50MB限制",
+                    error="檔案大小超過500MB限制",
                     q6ds_classification_result=None,
                     asymmetry_classification_result=None,
                     marked_figure=None
