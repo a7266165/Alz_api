@@ -33,8 +33,10 @@ class FacePreprocessor:
         self.TILE_GRID_SIZE = 8
         
         # 鏡射參數
-        self.FEATHER_PX = 2  # 邊緣羽化像素
-        self.ERODE_PX = 0    # 邊緣收縮像素
+        self.FEATHER_PX = 2      # 邊緣羽化像素
+        self.ERODE_PX = 0        # 邊緣收縮像素
+        self.MIRROR_SIZE = (512, 512)  # 輸出尺寸
+        self.MARGIN = 0.08       # 畫布邊緣留白比例
     
     def process_images(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
@@ -60,8 +62,8 @@ class FacePreprocessor:
                 left_mirror, right_mirror = self.create_mirror_images(aligned)
                 
                 # 3. 直方圖校正（CLAHE）
-                left_corrected = self.histogram_matching_clahe(left_mirror)
-                right_corrected = self.histogram_matching_clahe(right_mirror)
+                left_corrected = self.apply_clahe(left_mirror)
+                right_corrected = self.apply_clahe(right_mirror)
                 
                 mirror_pairs.append((left_corrected, right_corrected))
                 
@@ -84,7 +86,7 @@ class FacePreprocessor:
             return image
         
         # 計算中軸線平均角度
-        angle = self._mid_line_angle_all_points(results, h, w)
+        angle = self._calculate_face_angle(results, h, w)
         
         # 旋轉圖片
         M = cv2.getRotationMatrix2D((w//2, h//2), -angle, 1.0)
@@ -92,7 +94,7 @@ class FacePreprocessor:
         
         return rotated
     
-    def _mid_line_angle_all_points(self, results, height: int, width: int) -> float:
+    def _calculate_face_angle(self, results, height: int, width: int) -> float:
         """
         計算所有中軸線段的平均角度
         """
@@ -122,55 +124,42 @@ class FacePreprocessor:
         """
         生成左臉和右臉的完整鏡射
         """
-        h, w = image.shape[:2]
-        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(img_rgb)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(image_rgb)
         
         if not results.multi_face_landmarks:
-            # 簡單的左右分割
-            mid = w // 2
-            left_half = image[:, :mid]
-            right_half = image[:, mid:]
-            left_mirror = np.hstack([left_half, cv2.flip(left_half, 1)])
-            right_mirror = np.hstack([cv2.flip(right_half, 1), right_half])
-            return cv2.resize(left_mirror, (w, h)), cv2.resize(right_mirror, (w, h))
+            # 沒有偵測到臉，返回原圖的複製
+            return image.copy(), image.copy()
         
-        # 獲取臉部標記點
+        # 取得臉部標點
         face_landmarks = results.multi_face_landmarks[0].landmark
         pts_xy = self._landmarks_to_xy(face_landmarks, image.shape)
         
-        # 估計臉部中線
-        p0, n = self._estimate_midline_from_landmarks(pts_xy)
+        # 建立臉部遮罩
+        mask = self._build_face_mask(image.shape, pts_xy)
         
-        # 計算每個像素到中線的有號距離
-        Y, X = np.mgrid[:h, :w]
-        XY = np.stack([X, Y], axis=-1).reshape(-1, 2)
-        d = ((XY - p0) @ n).reshape(h, w)
+        # 估計中線
+        p0, n = self._estimate_midline(pts_xy)
         
-        # 生成左臉鏡射（保留左半邊）
-        left_mirror = image.copy()
-        for y in range(h):
-            for x in range(w):
-                if d[y, x] > 0:  # 右半邊
-                    # 找到對應的左半邊像素
-                    reflected_x = int(p0[0] - (x - p0[0]))
-                    if 0 <= reflected_x < w:
-                        left_mirror[y, x] = image[y, reflected_x]
+        # 建立鏡射影像 - 使用與4080版本相同的方法
+        left_mirror = self._align_to_canvas_premul(
+            image, mask, p0, n,
+            side='left',
+            out_size=self.MIRROR_SIZE,
+            margin=self.MARGIN
+        )
         
-        # 生成右臉鏡射（保留右半邊）
-        right_mirror = image.copy()
-        for y in range(h):
-            for x in range(w):
-                if d[y, x] < 0:  # 左半邊
-                    # 找到對應的右半邊像素
-                    reflected_x = int(p0[0] + (p0[0] - x))
-                    if 0 <= reflected_x < w:
-                        right_mirror[y, x] = image[y, reflected_x]
+        right_mirror = self._align_to_canvas_premul(
+            image, mask, p0, n,
+            side='right',
+            out_size=self.MIRROR_SIZE,
+            margin=self.MARGIN
+        )
         
         return left_mirror, right_mirror
     
-    def _landmarks_to_xy(self, landmarks, img_shape) -> np.ndarray:
-        """將FaceMesh相對座標轉為像素座標"""
+    def _landmarks_to_xy(self, landmarks, img_shape: tuple) -> np.ndarray:
+        """將 FaceMesh 的相對座標轉為像素座標"""
         h, w = img_shape[:2]
         pts = []
         for lm in landmarks:
@@ -179,20 +168,25 @@ class FacePreprocessor:
             pts.append([x, y])
         return np.array(pts, dtype=np.float64)
     
-    def _estimate_midline_from_landmarks(self, face_points_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        使用PCA估計臉部中線
-        返回：中線上一點p0和單位法向量n
-        """
-        # 使用中線關鍵點
-        midline_idx = (10, 151, 9, 8, 168, 6, 197, 195, 5, 4, 1, 19, 94, 2)
-        
-        # 過濾有效索引
+    def _build_face_mask(self, img_shape: tuple, face_points_xy: np.ndarray) -> np.ndarray:
+        """建立臉部遮罩"""
+        mask = np.zeros(img_shape[:2], dtype=np.uint8)
+        if face_points_xy.shape[0] == 0:
+            return mask
+        hull = cv2.convexHull(face_points_xy.astype(np.int32))
+        cv2.fillConvexPoly(mask, hull, 255)
+        return mask
+    
+    def _estimate_midline(
+        self,
+        face_points_xy: np.ndarray,
+        midline_idx: tuple = (10, 151, 9, 8, 168, 6, 197, 195, 5, 4, 1, 19, 94, 2)
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """估計臉部中線 - 與4080版本對齊"""
         idx = np.array(midline_idx, dtype=int)
         idx = idx[(idx >= 0) & (idx < face_points_xy.shape[0])]
         
         if idx.size == 0:
-            # 使用整臉點
             ml_pts = face_points_xy
         else:
             idx = np.unique(idx)
@@ -221,10 +215,232 @@ class FacePreprocessor:
         
         return p0, n
     
-    def histogram_matching_clahe(self, image: np.ndarray) -> np.ndarray:
+    def _make_half_alpha(
+        self,
+        mask_u8: np.ndarray,
+        d: np.ndarray,
+        side: str,
+        feather_px: int = 2,
+        erode_px: int = 0
+    ) -> np.ndarray:
+        """生成半臉 alpha mask with feathering"""
+        h, w = mask_u8.shape
+        a_mask = mask_u8.astype(np.float32) / 255.0
+        
+        # 根據 side 生成基本 alpha
+        if side == 'left':
+            alpha = np.where(d <= 0, 1.0, 0.0)
+        else:
+            alpha = np.where(d >= 0, 1.0, 0.0)
+        
+        # 邊緣羽化
+        if feather_px > 0:
+            if side == 'left':
+                # 左半臉：在 d=0 附近羽化
+                alpha = np.where(
+                    np.abs(d) < feather_px,
+                    0.5 - 0.5 * d / feather_px,
+                    alpha
+                )
+            else:
+                # 右半臉：在 d=0 附近羽化
+                alpha = np.where(
+                    np.abs(d) < feather_px,
+                    0.5 + 0.5 * d / feather_px,
+                    alpha
+                )
+        
+        # 與臉部遮罩結合
+        alpha = alpha * a_mask
+        
+        # 可選的邊緣收縮
+        if erode_px > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2*erode_px+1, 2*erode_px+1)
+            )
+            alpha = cv2.erode(alpha, kernel)
+        
+        return alpha.astype(np.float32)
+    
+    def _remap_premultiplied(
+        self,
+        img_bgr: np.ndarray,
+        alpha: np.ndarray,
+        Xr: np.ndarray,
+        Yr: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """使用預乘 alpha 進行重映射"""
+        img_f = img_bgr.astype(np.float32) / 255.0
+        premul = img_f * alpha[..., None]
+        
+        # 重映射
+        premul_ref = cv2.remap(
+            premul, Xr, Yr,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        a_ref = cv2.remap(
+            alpha, Xr, Yr,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        eps = 1e-6
+        rgb_ref = np.where(
+            a_ref[..., None] > eps,
+            premul_ref / a_ref[..., None],
+            0
+        )
+        
+        rgb_ref_u8 = np.clip(rgb_ref * 255.0, 0, 255).astype(np.uint8)
+        return rgb_ref_u8, a_ref
+    
+    def _align_to_canvas_premul(
+        self,
+        img_bgr: np.ndarray,
+        mask_u8: np.ndarray,
+        p0: np.ndarray,
+        n: np.ndarray,
+        side: str,
+        out_size: Tuple[int, int] = (512, 512),
+        margin: float = 0.08
+    ) -> np.ndarray:
+        """
+        對齊到畫布並使用預乘 alpha - 與4080版本對齊
+        """
+        H, W = out_size
+        h, w = img_bgr.shape[:2]
+        
+        # 計算有號距離
+        X, Y = np.meshgrid(
+            np.arange(w, dtype=np.float32),
+            np.arange(h, dtype=np.float32)
+        )
+        d = (X - p0[0]) * n[0] + (Y - p0[1]) * n[1]
+        
+        # 反射座標
+        Xr = X - 2.0 * d * n[0]
+        Yr = Y - 2.0 * d * n[1]
+        
+        # 建立半臉 alpha
+        alpha_half = self._make_half_alpha(mask_u8, d, side, self.FEATHER_PX, self.ERODE_PX)
+        
+        # 反射半臉
+        reflect_rgb, reflect_a = self._remap_premultiplied(img_bgr, alpha_half, Xr, Yr)
+        
+        # 合成
+        img_f = img_bgr.astype(np.float32) / 255.0
+        eps = 1e-6
+        
+        premul = img_f * alpha_half[..., None] + \
+                 (reflect_rgb.astype(np.float32)/255.0) * reflect_a[..., None]
+        alpha_total = np.clip(alpha_half + reflect_a, 0.0, 1.0)
+        
+        composite = np.where(
+            alpha_total[..., None] > eps,
+            premul / alpha_total[..., None],
+            0
+        )
+        composite = (np.clip(composite, 0, 1) * 255.0).astype(np.uint8)
+        
+        # 更新遮罩
+        mask_composite = np.clip(alpha_total * 255.0, 0, 255).astype(np.uint8)
+        
+        # 旋轉對齊並縮放到輸出尺寸
+        result = self._rotate_and_scale_to_canvas(
+            composite, mask_composite, p0, n, out_size, margin
+        )
+        
+        return result
+    
+    def _rotate_and_scale_to_canvas(
+        self,
+        img_bgr: np.ndarray,
+        mask_u8: np.ndarray,
+        p0: np.ndarray,
+        n: np.ndarray,
+        out_size: Tuple[int, int],
+        margin: float
+    ) -> np.ndarray:
+        """旋轉、縮放並置中到畫布"""
+        H, W = out_size
+        
+        # 計算旋轉角度（讓中線垂直）
+        u = np.array([n[1], -n[0]], dtype=np.float64)
+        u /= (np.linalg.norm(u) + 1e-12)
+        if u[1] < 0:
+            u = -u
+        angle = np.arctan2(u[0], u[1])
+        cos, sin = np.cos(angle), np.sin(angle)
+        
+        # 旋轉矩陣（繞 p0）
+        R = np.array([
+            [cos, -sin, (1 - cos) * p0[0] + sin * p0[1]],
+            [sin,  cos, (1 - cos) * p0[1] - sin * p0[0]]
+        ], dtype=np.float32)
+        
+        # 先旋轉遮罩以計算邊界框
+        m_rot = cv2.warpAffine(
+            mask_u8, R, (img_bgr.shape[1], img_bgr.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        ys, xs = np.where(m_rot > 0)
+        if xs.size == 0 or ys.size == 0:
+            return np.zeros((H, W, 3), dtype=np.uint8)
+        
+        x0, x1 = xs.min(), xs.max()
+        y0, y1 = ys.min(), ys.max()
+        bw, bh = (x1 - x0 + 1), (y1 - y0 + 1)
+        
+        # 計算縮放比例
+        Wfit = int(round(W * (1 - 2 * margin)))
+        Hfit = int(round(H * (1 - 2 * margin)))
+        Wfit = max(Wfit, 1)
+        Hfit = max(Hfit, 1)
+        
+        s = min(Wfit / max(bw, 1), Hfit / max(bh, 1))
+        
+        # 組合最終變換矩陣
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        
+        # 先旋轉，再縮放，最後平移到畫布中心
+        R3 = np.vstack([R, [0, 0, 1]]).astype(np.float32)
+        S3 = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
+        
+        center_vec = np.array([cx, cy, 1.0], dtype=np.float32)
+        center_rot = S3 @ (R3 @ center_vec)
+        target = np.array([W / 2.0, H / 2.0, 1.0], dtype=np.float32)
+        
+        tx, ty = (target - center_rot)[:2]
+        T3 = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float32)
+        
+        M3 = T3 @ S3 @ R3
+        M = M3[:2, :]
+        
+        # 應用變換
+        result = cv2.warpAffine(
+            img_bgr, M, (W, H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        return result
+
+    def apply_clahe(self, image: np.ndarray) -> np.ndarray:
         """
         在Lab色彩空間的L通道進行自適應直方圖均衡化
         """
+        # 確保影像格式正確
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        
         # 轉換到Lab色彩空間
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
