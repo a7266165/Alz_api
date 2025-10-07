@@ -7,6 +7,9 @@ from deepface import DeepFace
 import json
 import logging
 from typing import Optional, List, Tuple
+import os
+from datetime import datetime
+
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +110,7 @@ class VGGFaceExtractor:
             gender: 性別 (0=女, 1=男)
             
         Returns:
-            篩選後的特徵向量（166維）
+            篩選後的特徵向量
         """
         # 1. 提取所有差異特徵
         all_differences = []
@@ -119,23 +122,59 @@ class VGGFaceExtractor:
         if not all_differences:
             raise ValueError("無法提取有效特徵")
         
-        print(f"  成功提取 {len(all_differences)} 張照片的特徵")
-        
+        # ========== 調試開始：儲存平均前特徵 ==========
+        os.makedirs("temp", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open(f"temp/features_before_average_{timestamp}.json", 'w') as f:
+            json.dump({
+                "stage": "before_average",
+                "count": len(all_differences),
+                "features": [feat.tolist() for feat in all_differences],
+                "dimensions": [len(feat) for feat in all_differences],
+                "age": age,
+                "gender": gender
+            }, f, indent=2)
+        print(f"  [調試] 已儲存平均前特徵: temp/features_before_average_{timestamp}.json")
+        # ========== 調試結束：儲存平均前特徵 ==========
+
         # 2. 平均多張照片的特徵 (4096維)
         avg_features = np.mean(all_differences, axis=0)
-        print(f"  平均特徵維度: {avg_features.shape[0]}")
         
         # 3. 加入人口學特徵 (變成4098維)
         combined_features = np.concatenate([
             avg_features,      # 4096維 VGGFace差異特徵
             [age, gender]      # 2維 人口學特徵
         ])
-        print(f"  加入人口學後: {combined_features.shape[0]}維")
-        
+
+        # ========== 調試開始：儲存平均後特徵 ==========
+        with open(f"temp/features_after_average_{timestamp}.json", 'w') as f:
+            json.dump({
+                "stage": "after_average",
+                "feature_vector": combined_features.tolist(),
+                "dimensions": len(combined_features),
+                "vggface_dims": len(avg_features),
+                "age": age,
+                "gender": gender
+            }, f, indent=2)
+        print(f"  [調試] 已儲存平均後特徵: temp/features_after_average_{timestamp}.json")
+        # ========== 調試結束：儲存平均後特徵 ==========
+
         # 4. 應用特徵選擇
         selected_features = self.apply_feature_selection(combined_features)
-        print(f"  特徵選擇後: {selected_features.shape[0]}維")
         
+        # ========== 調試開始：儲存篩選後特徵 ==========
+        with open(f"temp/features_after_selection_{timestamp}.json", 'w') as f:
+            json.dump({
+                "stage": "after_selection",
+                "feature_vector": selected_features.tolist(),
+                "dimensions": len(selected_features),
+                "original_dims": len(combined_features),
+                "age": age,
+                "gender": gender
+            }, f, indent=2)
+        print(f"  [調試] 已儲存篩選後特徵: temp/features_after_selection_{timestamp}.json")
+        # ========== 調試結束：儲存篩選後特徵 ==========
+
         return selected_features
     
     def apply_feature_selection(self, features: np.ndarray) -> np.ndarray:

@@ -342,6 +342,10 @@ class FaceAnalysisAPI:
         # 選出角度絕對值最小的10張圖
         selected_files = sorted(angle_dict, key=lambda x: angle_dict[x])[:10]
 
+        # DEBUG
+        for file in sorted(selected_files, key=lambda x: int(x.split('image')[1].split('.')[0])):
+            print(f"  [DEBUG] 選取圖片: {file}, 角度: {angle_dict[file]}")
+
         # 旋轉圖片
         rotated_images = []
         for file in selected_files:
