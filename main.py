@@ -72,8 +72,7 @@ class FaceAnalysisAPI:
             static_image_mode=True,
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.8,
         )
         
         self.symmetry_csv_path = symmetry_csv_path
@@ -212,8 +211,8 @@ class FaceAnalysisAPI:
             asymmetry_classification = None
             
             # 預處理：對齊、鏡射、CLAHE
-            mirror_pairs = self.preprocessor.process_images(rotated_images)
-            
+            mirror_pairs = self.preprocessor.process_images(rotated_images)            
+
             # 特徵提取 + 人口學 + 特徵選擇
             age = questionnaire_data.age if questionnaire_data else 65
             gender = questionnaire_data.gender if questionnaire_data else 1
@@ -290,14 +289,6 @@ class FaceAnalysisAPI:
                 angles.append(90.0 if vector[0] > 0 else -90.0)
         
         return sum(angles) / len(angles) if angles else 0
-
-    def _mid_line_angle_all_points(self, results, height: int, width: int) -> float:
-        """計算人臉中軸線各段的角度，並回傳平均角度"""
-        angles = []
-        for i, j in self.FACEMESH_MID_LINE:
-            p1, p2 = self._get_point(results, i, width, height), self._get_point(results, j, width, height)
-            angles.append(np.degrees(np.arctan2(p2[0] - p1[0], p2[1] - p1[1])))
-        return sum(angles) / len(angles)
 
     def _rotate_image(self, image: np.ndarray) -> np.ndarray:
         """

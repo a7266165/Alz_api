@@ -46,8 +46,8 @@ class VGGFaceExtractor:
                 img_path=img_array,
                 model_name='VGG-Face',
                 enforce_detection=False,
-                detector_backend='opencv',  # 已經預處理過了
-                align=True  # 已經對齊過了
+                detector_backend='opencv',
+                align=True
             )
             
             if result and len(result) > 0:

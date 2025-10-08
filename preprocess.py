@@ -41,9 +41,9 @@ class FacePreprocessor:
     def process_images(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
         完整的預處理管線
-        1. 角度校正
-        2. 鏡射生成
-        3. 直方圖校正
+        1. 鏡射生成  # 原本是角度校正
+        2. 直方圖校正
+        3. 角度校正  # 原本是鏡射生成
         
         Returns:
             List of (left_mirror, right_mirror) tuples
@@ -55,23 +55,29 @@ class FacePreprocessor:
         
         for img in images:
             try:
-                # 1. 角度校正（對齊）
-                aligned = self.align_face(img)
+                # 1. 生成鏡射對（先鏡射，不先校正）
+                left_mirror, right_mirror = self.create_mirror_images(img)
                 
-                # 2. 生成鏡射對
-                left_mirror, right_mirror = self.create_mirror_images(aligned)
-                
-                # 3. 直方圖校正（CLAHE）
+                # 2. 直方圖校正（CLAHE）
                 left_corrected = self.apply_clahe(left_mirror)
                 right_corrected = self.apply_clahe(right_mirror)
                 
-                mirror_pairs.append((left_corrected, right_corrected))
+                # 3. 角度校正（最後才對齊）
+                left_aligned = self.align_face(left_corrected)
+                right_aligned = self.align_face(right_corrected)
+                
+                mirror_pairs.append((left_aligned, right_aligned))
                 
             except Exception as e:
                 print(f"處理圖片時發生錯誤: {e}")
                 # 如果處理失敗，使用原圖
                 mirror_pairs.append((img, img))
         
+        # DEBUG: 儲存處理後的圖片
+        for idx, (left_img, right_img) in enumerate(mirror_pairs):
+            cv2.imwrite(f"temp/preprocess_pic/left_mirror_{idx}.png", left_img)
+            cv2.imwrite(f"temp/preprocess_pic/right_mirror_{idx}.png", right_img)
+
         return mirror_pairs
     
     def align_face(self, image: np.ndarray) -> np.ndarray:
